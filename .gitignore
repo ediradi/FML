@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Umgebung
+.venv/
+venv/
+.env
+
+# Ergebnisse und Logs
+results/
+runs/
+wandb/
+*.log
+
+# Flower / Ray
+.flwr/
+ray_results/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Archive
+*.zip
