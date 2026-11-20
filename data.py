@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -99,6 +100,34 @@ def load_processed():
     y_tr = tr[TARGET].to_numpy(np.int64)
     y_te = te[TARGET].to_numpy(np.int64)
     return X_tr, y_tr, X_te, y_te, list(pre.get_feature_names_out()), tr, te
+
+
+def load_dataset(val_size: float = 0.15, seed: int = 42) -> dict:
+    """Train/Val/Test für die Experimente.
+
+    - Test = offizielles adult.test, wird nur für die finale Auswertung verwendet
+    - Val  = stratifizierter Anteil von adult.data, für Tuning und Early Stopping
+    - Der Preprocessor wird nur auf dem Train-Anteil gefittet (kein Leakage aus Val/Test)
+
+    Rückgabe: dict mit X_train, y_train, X_val, y_val, X_test, y_test (numpy),
+    feature_names sowie den Roh-DataFrames df_train, df_val, df_test
+    (für attributbasierte Partitionierung, z. B. nach Alter).
+    """
+    tr, te = load_raw()
+    tr, va = train_test_split(tr, test_size=val_size, stratify=tr[TARGET], random_state=seed)
+    tr, va = tr.reset_index(drop=True), va.reset_index(drop=True)
+    pre = make_preprocessor()
+    X = {
+        "train": pre.fit_transform(_log_capital(tr)),
+        "val": pre.transform(_log_capital(va)),
+        "test": pre.transform(_log_capital(te)),
+    }
+    out = {f"X_{k}": v.astype(np.float32) for k, v in X.items()}
+    out.update({f"y_{k}": d[TARGET].to_numpy(np.int64)
+                for k, d in (("train", tr), ("val", va), ("test", te))})
+    out.update(feature_names=list(pre.get_feature_names_out()),
+               df_train=tr, df_val=va, df_test=te)
+    return out
 
 
 if __name__ == "__main__":
