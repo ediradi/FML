@@ -155,7 +155,7 @@ def run_fedavg(
 
     n_clients = len(partitions)
 
-    evaluate_fn, history = make_evaluate_fn(
+    evaluate_fn, metrics_history = make_evaluate_fn(
         X_test,
         y_test,
     )
@@ -195,14 +195,12 @@ def run_fedavg(
         }
     }
 
-    fl.simulation.run_simulation(
+    fl_history  = fl.simulation.start_simulation(
         client_fn=client_fn,
-        num_supernodes=n_clients,
-        config=fl.server.ServerConfig(
-            num_rounds=rounds
-        ),
+        num_clients=n_clients,
+        config=fl.server.ServerConfig(num_rounds=rounds),
         strategy=strategy,
-        backend_config=backend_config,
+        client_resources={"num_cpus": 1},
     )
 
-    return history
+    return metrics_history 
