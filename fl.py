@@ -14,9 +14,13 @@ Aufruf (z. B. im Notebook):
 """
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
+import sys
 import time
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -147,6 +151,10 @@ def make_server_app(store: dict, strategy: str, n_clients: int, num_rounds: int,
             num_rounds=num_rounds, train_config=ConfigRecord(train_cfg),
             evaluate_fn=central_eval)
         store["result"] = result
+        if store.get("save_to") and result.train_metrics_clientapp:  # nur bei Client-Antworten
+            # sofort speichern, noch bevor Ray herunterfährt (unter Windows kann
+            # ray.shutdown() mit "access violation" abstürzen)
+            _save(store, result, d["X_train"].shape[1], hidden, dropout)
 
     return app
 
@@ -164,13 +172,61 @@ def _to_frame(result) -> pd.DataFrame:
     return df.reset_index()
 
 
+def _save(store: dict, result, in_dim: int, hidden: tuple, dropout: float) -> None:
+    out = Path(store["save_to"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df = _to_frame(result)
+    for k, v in {**store["meta"], "runtime_s": round(time.time() - store["t0"], 1)}.items():
+        df[k] = v
+    df.to_csv(out, index=False)
+    m = MLP(in_dim, hidden, dropout)
+    m.load_state_dict(result.arrays.to_torch_state_dict())
+    torch.save(m.state_dict(), out.with_suffix(".pt"))
+
+
+def load_model(path, in_dim: int = 89, hidden: tuple = (64, 32), dropout: float = 0.1) -> MLP:
+    """Finales globales Modell eines gespeicherten Laufs (CSV- oder .pt-Pfad)."""
+    m = MLP(in_dim, tuple(hidden), dropout)
+    m.load_state_dict(torch.load(Path(path).with_suffix(".pt")))
+    return m
+
+
+def run_cached(path, force: bool = False, verbose: bool = True, **kw) -> pd.DataFrame:
+    """Führt run_fl(**kw) in einem eigenen Python-Prozess aus und speichert nach `path` (.csv).
+
+    - Existiert die CSV schon, wird sie geladen (force=True rechnet neu).
+    - Eigener Prozess: Ray und Flower laufen nicht im Jupyter-Kernel. Ein Absturz von Ray
+      beim Herunterfahren (bekannt unter Windows) betrifft nur den Hilfsprozess; die
+      Ergebnisse sind zu diesem Zeitpunkt bereits gespeichert.
+    """
+    path = Path(path)
+    if path.exists() and not force:
+        return pd.read_csv(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--out", str(path),
+           "--kwargs", json.dumps(kw)]
+    proc = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent),
+                          capture_output=True, text=True)
+    if not path.exists():
+        print(proc.stdout[-3000:], proc.stderr[-6000:], sep="\n")
+        raise RuntimeError(f"Lauf {path.name} fehlgeschlagen (Exit-Code {proc.returncode}), Log oben")
+    df = pd.read_csv(path)
+    if verbose:
+        note = "" if proc.returncode == 0 else f"  (Hilfsprozess Exit-Code {proc.returncode}, Ergebnis gesichert)"
+        print(f"{path.stem}: {df.runtime_s.iloc[0]:.0f}s, Test-Acc letzte Runde "
+              f"{df.test_accuracy.iloc[-1]:.4f}{note}")
+    return df
+
+
 def run_fl(partition: str = "iid", n_clients: int = 10, num_rounds: int = 20,
            local_epochs: int = 1, lr: float = 1e-3, batch_size: int = 64,
            optimizer: str = "adam", strategy: str = "fedavg", strategy_kwargs: dict | None = None,
            fraction_train: float = 1.0, fraction_evaluate: float = 0.0,
            alpha: float = 0.5, by: str = "age", part_seed: int = 42, seed: int = 42,
            hidden: tuple = (64, 32), dropout: float = 0.1, num_cpus_per_client: float = 1.0,
-           return_model: bool = False, quiet: bool = True):
+           return_model: bool = False, quiet: bool = True, save_to: str | None = None):
     """Eine FL-Simulation. Gibt DataFrame (Metriken pro Runde, Runde 0 = Startmodell)
     zurück, mit return_model=True zusätzlich das finale globale Modell.
 
@@ -182,8 +238,11 @@ def run_fl(partition: str = "iid", n_clients: int = 10, num_rounds: int = 20,
     strategy_kwargs = dict(strategy_kwargs or {})
     train_cfg = {"local-epochs": local_epochs, "lr": lr, "batch-size": batch_size,
                  "optimizer": optimizer, "seed": seed}
-    store: dict = {}
     t0 = time.time()
+    meta = dict(partition=partition, n_clients=n_clients, strategy=strategy,
+                local_epochs=local_epochs, lr=lr, batch_size=batch_size,
+                fraction_train=fraction_train, alpha=alpha, seed=seed, **strategy_kwargs)
+    store: dict = {"save_to": save_to, "meta": meta, "t0": t0}
     # quiet: nur Fehler von Flower anzeigen (u. a. Hinweis, dass run_simulation zugunsten
     # von `flwr run` abgekündigt ist – für Notebook-Experimente bewusst weiter verwendet)
     logging.getLogger("flwr").setLevel(logging.ERROR if quiet else logging.INFO)
@@ -201,10 +260,7 @@ def run_fl(partition: str = "iid", n_clients: int = 10, num_rounds: int = 20,
         # Flower läuft weiter, auch wenn alle Clients abstürzen -> globales Modell bliebe untrainiert
         raise RuntimeError("Keine Client-Antworten erhalten – Fehler der ClientApps im Log oben prüfen")
     df = _to_frame(store["result"])
-    df.attrs.update(dict(partition=partition, n_clients=n_clients, strategy=strategy,
-                         local_epochs=local_epochs, lr=lr, batch_size=batch_size,
-                         alpha=alpha, seed=seed, runtime_s=round(time.time() - t0, 1),
-                         **strategy_kwargs))
+    df.attrs.update(meta, runtime_s=round(time.time() - t0, 1))
     if return_model:
         m = MLP(_data()["X_train"].shape[1], hidden, dropout)
         m.load_state_dict(store["result"].arrays.to_torch_state_dict())
@@ -214,7 +270,19 @@ def run_fl(partition: str = "iid", n_clients: int = 10, num_rounds: int = 20,
 
 if __name__ == "__main__":
     # Direktaufruf: Funktionen per Import laden, sonst findet Ray sie in den Workern nicht
+    import argparse
+
     import fl
-    h = fl.run_fl(partition="iid", n_clients=5, num_rounds=5, local_epochs=1)
-    print(h[["round", "val_accuracy", "test_accuracy", "test_f1"]].round(4))
-    print(h.attrs)
+
+    ap = argparse.ArgumentParser(description="Einzelner FL-Lauf (wird von run_cached genutzt)")
+    ap.add_argument("--out", help="Ziel-CSV")
+    ap.add_argument("--kwargs", default="{}", help="Argumente für run_fl als JSON")
+    a = ap.parse_args()
+    kw = json.loads(a.kwargs)
+    if "hidden" in kw:
+        kw["hidden"] = tuple(kw["hidden"])
+    if a.out:
+        fl.run_fl(save_to=a.out, **kw)
+    else:  # Schnelltest: python fl.py
+        h = fl.run_fl(partition="iid", n_clients=5, num_rounds=5, local_epochs=1)
+        print(h[["round", "val_accuracy", "test_accuracy", "test_f1"]].round(4))
